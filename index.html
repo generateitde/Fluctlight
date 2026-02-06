@@ -38,7 +38,7 @@
     <div id="status">Ready. Für Mic: HTTPS nötig, speziell auf iOS. Erst Button tippen.</div>
   </div>
   <div id="hint">
-    Sprich ins Mikro. Lautstärke steuert Ausschlag. Spektrum steuert Cluster und Schimmer.
+    Sprich ins Mikro. Lautstärke + Tonhöhe treiben jetzt wellenförmige Peaks nach außen.
   </div>
 
   <script type="module">
@@ -120,7 +120,7 @@
     micBtn.addEventListener("click", async () => {
       try {
         await startMic();
-        statusEl.textContent = "Mic läuft. Sprich. Lauter = mehr Ausschlag. Heller Klang = andere Cluster.";
+        statusEl.textContent = "Mic läuft. Sprich. Lauter + höher = stärkere, dynamische Wellen-Peaks nach außen.";
       } catch (e) {
         statusEl.textContent = "Mic Fehler: " + (e?.message || String(e));
       }
@@ -214,6 +214,7 @@
       uniform float uBand0;
       uniform float uBand2;
       uniform float uPulse;
+      uniform float uMorph;
 
       uniform vec3 uEmitters[${E}];
 
@@ -221,11 +222,18 @@
       varying float vRn;
       varying float vSeed;
 
+      float hash13(vec3 p) {
+        p = fract(p * 0.1031);
+        p += dot(p, p.yzx + 33.33);
+        return fract((p.x + p.y) * p.z);
+      }
+
       void main() {
         vRn = aRn;
         vSeed = aSeed;
 
         vec3 p = position;
+        vec3 dir = normalize(p + vec3(0.0001));
 
         float kShell = 8.5 + 10.0 * uBright;
         float shellSpeed = 0.6 + 2.2 * uAmp;
@@ -238,6 +246,25 @@
         float shellStrength = 0.25 + 1.15 * uAmp;
 
         float intensity = base * (0.85 + shellStrength * (wave - 0.5) * envelope);
+
+        float pitchGain = 0.45 + 1.55 * uBright;
+        float spikeDrive = clamp(0.2 + 1.45 * uAmp + 0.75 * uBand2 + 0.45 * uPulse, 0.0, 2.3);
+        float n1 = hash13(dir * (8.0 + uMorph * 4.0) + vec3(vSeed * 11.0, uTime * 0.19, uMorph));
+        float n2 = hash13(dir.zyx * (13.0 + uMorph * 2.5) + vec3(uTime * 0.27, vSeed * 17.0, 1.7 + uMorph));
+        float randomMask = pow(clamp(0.56 * n1 + 0.44 * n2, 0.0, 1.0), 3.8 - 2.0 * clamp(uAmp + 0.35 * uBand2, 0.0, 1.0));
+
+        float radialWave = 0.5 + 0.5 * sin(
+          (12.0 + 14.0 * pitchGain) * vRn
+          - uTime * (2.2 + 4.6 * uAmp + 1.4 * uBand2)
+          + (vSeed * 8.0 + n1 * 4.0)
+        );
+
+        float outerBias = smoothstep(0.16, 0.98, vRn);
+        float spikeEnvelope = pow(radialWave, 1.2 + 2.4 * uBright) * outerBias;
+        float spikeAmount = (0.06 + 0.42 * spikeDrive * spikeEnvelope) * (0.45 + 1.85 * randomMask);
+
+        p += dir * spikeAmount;
+        intensity += clamp(spikeAmount * (1.1 + 1.2 * uBright), 0.0, 0.9);
 
         float emitterGain = 0.25 + 1.4 * uBand0;
         float cluster = 0.0;
@@ -321,6 +348,7 @@
         uBand0: { value: 0.0 },
         uBand2: { value: 0.0 },
         uPulse: { value: 0.0 },
+        uMorph: { value: Math.random() },
         uEmitters: { value: new Array(E).fill(0).map((_,i)=> new THREE.Vector3(
           emitters[3*i+0], emitters[3*i+1], emitters[3*i+2]
         )) }
@@ -342,6 +370,7 @@
     });
 
     let t = 0;
+    let morph = Math.random();
     function animate() {
       requestAnimationFrame(animate);
       if (paused) return;
@@ -358,6 +387,8 @@
       material.uniforms.uBand0.value = clamp01(band0);
       material.uniforms.uBand2.value = clamp01(band2);
       material.uniforms.uPulse.value = clamp01(audioPulse);
+      morph = (morph + 0.008 + 0.03 * amp + 0.02 * bright) % 1.0;
+      material.uniforms.uMorph.value = morph;
 
       points.rotation.y += 0.0016;
       points.rotation.x += 0.0006;
