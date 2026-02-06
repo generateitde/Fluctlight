@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Neural Sphere Shader Audio Reactive</title>
+  <style>
+    html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#02040a; }
+    #ui {
+      position: fixed; left: 12px; top: 12px; z-index: 10;
+      display: flex; gap: 10px; align-items: center;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      color: rgba(200,220,255,0.95);
+      user-select: none;
+    }
+    button {
+      border: 1px solid rgba(120,160,255,0.35);
+      background: rgba(10,20,40,0.55);
+      color: rgba(220,235,255,0.95);
+      padding: 10px 12px;
+      border-radius: 10px;
+      font-size: 14px;
+      backdrop-filter: blur(6px);
+    }
+    #status { font-size: 12px; opacity: 0.9; max-width: 62vw; line-height: 1.25; }
+    #hint {
+      position: fixed; left: 12px; bottom: 12px; z-index: 10;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      font-size: 12px; opacity: 0.75; color: rgba(200,220,255,0.9);
+      max-width: 92vw; line-height: 1.35;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <button id="micBtn">Start Mic</button>
+    <button id="pauseBtn">Pause</button>
+    <div id="status">Ready. Für Mic: HTTPS nötig, speziell auf iOS. Erst Button tippen.</div>
+  </div>
+  <div id="hint">
+    Sprich ins Mikro. Lautstärke steuert Ausschlag. Spektrum steuert Cluster und Schimmer.
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x02040a);
+
+    const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.01, 100);
+    camera.position.set(0, 0, 3.2);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const N = isMobile ? 90000 : 130000;
+    const radius = 1.0;
+
+    function randInSphere() {
+      while (true) {
+        const x = (Math.random()*2 - 1) * radius;
+        const y = (Math.random()*2 - 1) * radius;
+        const z = (Math.random()*2 - 1) * radius;
+        const r = Math.hypot(x,y,z);
+        if (r <= radius) return {x,y,z,r};
+      }
+    }
+
+    const pos = new Float32Array(N*3);
+    const rn = new Float32Array(N);
+    const seed = new Float32Array(N);
+
+    for (let i=0; i<N; i++) {
+      const p = randInSphere();
+      pos[3*i+0] = p.x;
+      pos[3*i+1] = p.y;
+      pos[3*i+2] = p.z;
+      rn[i] = p.r / radius;
+      seed[i] = Math.random();
+    }
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    geom.setAttribute("aRn", new THREE.BufferAttribute(rn, 1));
+    geom.setAttribute("aSeed", new THREE.BufferAttribute(seed, 1));
+
+    const E = 12;
+    const emitters = new Float32Array(E*3);
+
+    function resetEmitters() {
+      for (let i=0; i<E; i++) {
+        const p = randInSphere();
+        const s = 0.75;
+        emitters[3*i+0] = p.x*s;
+        emitters[3*i+1] = p.y*s;
+        emitters[3*i+2] = p.z*s;
+      }
+    }
+    resetEmitters();
+
+    let audioCtx = null;
+    let analyser = null;
+    let freqData = null;
+    let timeData = null;
+
+    let audioRMS = 0.0;
+    let audioCentroid = 0.0;
+    let audioPulse = 0.0;
+    let band0 = 0.0;
+    let band2 = 0.0;
+
+    const statusEl = document.getElementById("status");
+    const micBtn = document.getElementById("micBtn");
+    const pauseBtn = document.getElementById("pauseBtn");
+    let paused = false;
+
+    micBtn.addEventListener("click", async () => {
+      try {
+        await startMic();
+        statusEl.textContent = "Mic läuft. Sprich. Lauter = mehr Ausschlag. Heller Klang = andere Cluster.";
+      } catch (e) {
+        statusEl.textContent = "Mic Fehler: " + (e?.message || String(e));
+      }
+    });
+
+    pauseBtn.addEventListener("click", () => {
+      paused = !paused;
+      pauseBtn.textContent = paused ? "Resume" : "Pause";
+    });
+
+    async function startMic() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+      const src = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.75;
+      src.connect(analyser);
+
+      freqData = new Uint8Array(analyser.frequencyBinCount);
+      timeData = new Uint8Array(analyser.fftSize);
+
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+    }
+
+    const clamp01 = (x) => Math.min(1, Math.max(0, x));
+
+    function avg(arr, a, b) {
+      let s = 0;
+      const n = Math.max(1, b - a);
+      for (let i=a; i<b; i++) s += arr[i];
+      return s / n;
+    }
+
+    function updateAudio() {
+      if (!analyser) {
+        audioRMS *= 0.96;
+        audioCentroid *= 0.96;
+        audioPulse *= 0.96;
+        band0 *= 0.96;
+        band2 *= 0.96;
+        return;
+      }
+
+      analyser.getByteFrequencyData(freqData);
+      analyser.getByteTimeDomainData(timeData);
+
+      let sumSq = 0;
+      for (let i=0; i<timeData.length; i++) {
+        const v = (timeData[i] - 128) / 128;
+        sumSq += v*v;
+      }
+      const rms = Math.sqrt(sumSq / timeData.length);
+      audioRMS = 0.85*audioRMS + 0.15*rms;
+
+      let magSum = 0;
+      let weighted = 0;
+      for (let i=0; i<freqData.length; i++) {
+        const m = freqData[i] / 255;
+        magSum += m;
+        weighted += m * i;
+      }
+      const centroid = (magSum > 1e-6) ? (weighted / magSum) / freqData.length : 0;
+      audioCentroid = 0.85*audioCentroid + 0.15*centroid;
+
+      const n = freqData.length;
+      const b0 = avg(freqData, 2, Math.floor(n*0.10));
+      const b2 = avg(freqData, Math.floor(n*0.35), Math.floor(n*0.85));
+      band0 = 0.85*band0 + 0.15*clamp01(b0/255);
+      band2 = 0.85*band2 + 0.15*clamp01(b2/255);
+
+      let low = 0;
+      const lowBins = Math.max(8, Math.floor(n*0.08));
+      for (let i=0; i<lowBins; i++) low += (freqData[i] / 255);
+      low /= lowBins;
+      const p = clamp01(low * 1.6);
+      audioPulse = Math.max(audioPulse * 0.92, p);
+    }
+
+    const vertexShader = `
+      precision highp float;
+
+      attribute float aRn;
+      attribute float aSeed;
+
+      uniform float uTime;
+      uniform float uAmp;
+      uniform float uBright;
+      uniform float uBand0;
+      uniform float uBand2;
+      uniform float uPulse;
+
+      uniform vec3 uEmitters[${E}];
+
+      varying float vIntensity;
+      varying float vRn;
+      varying float vSeed;
+
+      void main() {
+        vRn = aRn;
+        vSeed = aSeed;
+
+        vec3 p = position;
+
+        float kShell = 8.5 + 10.0 * uBright;
+        float shellSpeed = 0.6 + 2.2 * uAmp;
+        float base = 0.20
+          + 0.55 * pow(vRn, 0.60)
+          + 0.18 * exp(-pow(vRn / 0.22, 2.0));
+
+        float wave = 0.5 + 0.5 * sin(6.2831853 * (kShell * vRn - shellSpeed * uTime + vSeed * 0.35));
+        float envelope = exp(-pow((vRn - 0.55) / 0.28, 2.0));
+        float shellStrength = 0.25 + 1.15 * uAmp;
+
+        float intensity = base * (0.85 + shellStrength * (wave - 0.5) * envelope);
+
+        float emitterGain = 0.25 + 1.4 * uBand0;
+        float cluster = 0.0;
+
+        for (int i=0; i<${E}; i++) {
+          vec3 e = uEmitters[i];
+          float d = length(p - e);
+          float dn = d / 1.2;
+
+          float localPhase = (dn * 9.0 - uTime * (0.8 + float(i) * 0.07) + vSeed * 6.0);
+          float localWave = 0.5 + 0.5 * sin(localPhase * 2.2);
+          float localEnv = exp(-pow((dn - 0.35) / 0.22, 2.0));
+
+          cluster += localWave * localEnv;
+        }
+        cluster *= (1.0 / float(${E}));
+
+        intensity += emitterGain * uAmp * cluster;
+
+        float shimmerGain = 0.15 + 1.1 * uBand2;
+        float shimmer = 0.2 + 0.8 * sin(uTime * 8.0 + vSeed * 6.0);
+        intensity += shimmerGain * shimmer * (0.15 + 0.35 * uBand2) * (0.3 + 0.7 * envelope);
+
+        float beat = clamp(uBand0 + 0.45 * uPulse, 0.0, 1.0);
+        float breathe = 0.92 + 0.18 * smoothstep(0.1, 0.8, beat);
+        intensity *= breathe;
+
+        vIntensity = clamp(intensity, 0.0, 1.0);
+
+        vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
+        float size = ${isMobile ? "10.0" : "9.0"};
+        size *= (0.75 + 0.7 * uAmp + 0.35 * uPulse);
+        gl_PointSize = size * (1.0 / -mvPosition.z);
+
+        gl_Position = projectionMatrix * mvPosition;
+      }
+    `;
+
+    const fragmentShader = `
+      precision highp float;
+
+      uniform float uBright;
+
+      varying float vIntensity;
+      varying float vRn;
+      varying float vSeed;
+
+      void main() {
+        vec2 uv = gl_PointCoord * 2.0 - 1.0;
+        float r2 = dot(uv, uv);
+
+        float disc = exp(-r2 * 3.2);
+        float core = exp(-r2 * 14.0);
+
+        float intensity = vIntensity;
+        float r = 0.03 + 0.12 * intensity;
+        float g = 0.10 + (0.70 + 0.08 * uBright) * intensity;
+        float b = 0.18 + (0.92 + 0.06 * uBright) * intensity;
+
+        float sparkle = 0.08 * sin(vSeed * 437.0 + vRn * 19.0);
+        vec3 col = vec3(r, g, b) + sparkle * vec3(0.02, 0.06, 0.08);
+
+        float alpha = clamp(disc * (0.35 + 0.95 * intensity) + core * 0.25, 0.0, 1.0);
+
+        if (r2 > 1.0) discard;
+
+        gl_FragColor = vec4(col, alpha);
+      }
+    `;
+
+    const material = new THREE.ShaderMaterial({
+      vertexShader,
+      fragmentShader,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      uniforms: {
+        uTime: { value: 0.0 },
+        uAmp: { value: 0.0 },
+        uBright: { value: 0.0 },
+        uBand0: { value: 0.0 },
+        uBand2: { value: 0.0 },
+        uPulse: { value: 0.0 },
+        uEmitters: { value: new Array(E).fill(0).map((_,i)=> new THREE.Vector3(
+          emitters[3*i+0], emitters[3*i+1], emitters[3*i+2]
+        )) }
+      }
+    });
+
+    const points = new THREE.Points(geom, material);
+    scene.add(points);
+
+    addEventListener("pointerdown", (ev) => {
+      if (ev.target instanceof HTMLButtonElement) return;
+      resetEmitters();
+      for (let i=0; i<E; i++) {
+        material.uniforms.uEmitters.value[i].set(
+          emitters[3*i+0], emitters[3*i+1], emitters[3*i+2]
+        );
+      }
+      statusEl.textContent = "Emitter neu verteilt. Sprich weiter.";
+    });
+
+    let t = 0;
+    function animate() {
+      requestAnimationFrame(animate);
+      if (paused) return;
+
+      t += 0.012;
+      updateAudio();
+
+      const amp = clamp01(audioRMS * 2.4);
+      const bright = clamp01(audioCentroid * 1.4);
+
+      material.uniforms.uTime.value = t;
+      material.uniforms.uAmp.value = amp;
+      material.uniforms.uBright.value = bright;
+      material.uniforms.uBand0.value = clamp01(band0);
+      material.uniforms.uBand2.value = clamp01(band2);
+      material.uniforms.uPulse.value = clamp01(audioPulse);
+
+      points.rotation.y += 0.0016;
+      points.rotation.x += 0.0006;
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    addEventListener("resize", () => {
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    });
+  </script>
+</body>
+</html>
